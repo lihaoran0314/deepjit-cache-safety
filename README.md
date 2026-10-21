@@ -61,15 +61,13 @@ CUDA 和 Ascend 测试项目均增加：
 
 ## 当前验证状态
 
-本机为 Windows，缺少 DeepJIT 所需的 Linux/C++20、elfutils、CUDA/NVCC 或 Ascend 工具链，因此尚未本地编译。
+本机为 Windows，缺少 DeepJIT 所需的 Linux/C++20、elfutils、CUDA/NVCC 或 Ascend 工具链，因此没有在本地编译。
 
-提供 Ubuntu 验证脚本和 GitHub Actions workflow。审计时应先运行：
+GitHub Actions 的 Ubuntu 24.04 host smoke 已成功执行：
 
-```bash
-bash scripts/validate-on-ubuntu.sh
-```
+- https://github.com/lihaoran0314/deepjit-cache-safety/actions/runs/39524297315
 
-不要在上游 CI/人工审查通过前宣称补丁已经验证。
+该验证覆盖目录 symlink、dangling symlink、发布失败保留临时 payload，以及竞争写者提交后的安全复用。CUDA/Ascend 全量上游测试仍需对应设备工具链。
 
 ## 许可证
 
