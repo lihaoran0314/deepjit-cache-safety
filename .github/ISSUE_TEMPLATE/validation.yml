@@ -1,0 +1,32 @@
+name: Patch validation report
+description: Report a host or accelerator validation result
+title: "[validation] "
+labels: ["validation"]
+body:
+  - type: input
+    id: base
+    attributes:
+      label: DeepJIT base commit
+    validations:
+      required: true
+  - type: dropdown
+    id: environment
+    attributes:
+      label: Environment
+      options:
+        - Ubuntu host smoke
+        - CUDA
+        - Ascend
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: result
+    attributes:
+      label: Command and result
+    validations:
+      required: true
+  - type: textarea
+    id: limitations
+    attributes:
+      label: Remaining limitations
