@@ -1,0 +1,238 @@
+From 148d2ed9044c75d3704028a06e4b759cf8e12de5 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E4=B8=80=E6=9D=A1=E5=A4=A7=E8=82=A5=E9=B1=BC=5F=E6=9B=BC?=
+ =?UTF-8?q?=E6=B3=A2?= <130831832+lihaoran0314@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 08:51:35 +0800
+Subject: [PATCH] Fix disk cache publication and symlink-safe cleanup
+
+---
+ README.md                                |  4 ++
+ include/deep_jit/backend/cuda/kernel.hpp |  5 ++-
+ include/deep_jit/cache/disk.hpp          | 11 +++++-
+ include/deep_jit/utils/filesystem.hpp    | 13 +++++--
+ tests/test_ascend_proj/main.cpp          | 46 +++++++++++++++++++++++
+ tests/test_cuda_proj/main.cpp            | 47 ++++++++++++++++++++++++
+ 6 files changed, 118 insertions(+), 8 deletions(-)
+
+diff --git a/README.md b/README.md
+index 69f6ae4..8aae2c7 100644
+--- a/README.md
++++ b/README.md
+@@ -195,6 +195,10 @@ Calling `get_jit()` initializes the lazy runtime if it has not already been init
+ 
+ The CUDA backend requires CUDA headers 12.4 or newer and NVCC 12.9 or newer. It uses NVCC to generate a CUBIN. Loading through `compile()` requires exactly one CUDA kernel; `compile_without_load()` only builds the artifact and does not perform that check.
+ 
++### CUDA context affinity
++
++A `Runtime<deep_jit::CUDA>`, its cached `Kernel` objects, and the CUDA function handles they own are context-affine. Construct and use one runtime within one CUDA context/device; do not share it across contexts or heterogeneous devices. The on-disk CUBIN remains reusable: construct a separate runtime in each context/device, while keeping the same cache directory if the architecture matches.
++
+ ### Compile and launch
+ 
+ ```cpp
+diff --git a/include/deep_jit/backend/cuda/kernel.hpp b/include/deep_jit/backend/cuda/kernel.hpp
+index 915acf5..973f9b6 100644
+--- a/include/deep_jit/backend/cuda/kernel.hpp
++++ b/include/deep_jit/backend/cuda/kernel.hpp
+@@ -29,8 +29,9 @@ inline void* kernel_arg_pointer(const T& value) {
+     }
+ }
+ 
+-// Immutable CUDA kernel handles with shared ownership. Driver resources are
+-// unloaded when the last shared owner is destroyed.
++// Immutable CUDA kernel handles with shared ownership. A Kernel is bound to
++// the CUDA context/device active when it was loaded; do not share it across
++// contexts. Driver resources are unloaded when the last shared owner is destroyed.
+ class Kernel {
+ public:
+     CUlibrary library_handle{};
+diff --git a/include/deep_jit/cache/disk.hpp b/include/deep_jit/cache/disk.hpp
+index cd3f068..330772c 100644
+--- a/include/deep_jit/cache/disk.hpp
++++ b/include/deep_jit/cache/disk.hpp
+@@ -54,13 +54,20 @@ public:
+         std::error_code error_code;
+         std::filesystem::rename(path, commit_path, error_code);
+         if (error_code) {
+-            // Another rank beat us, then clean up our dir and use the existing one
++            // A failed rename is only a benign race when another writer has
++            // already published a complete entry at the destination.
++            std::error_code marker_error;
++            const bool published =
++                std::filesystem::is_regular_file(commit_path / kCommitFileName, marker_error) and not marker_error;
++            if (not published) {
++                DJ_PANIC("failed to publish disk cache entry: {} -> {}: {}",
++                         path.string(), commit_path.string(), error_code.message());
++            }
+             // NOTES: avoid `std::filesystem::remove_all` here — it can segfault on
+             // distributed filesystems, when concurrent processes operate
+             // on the same parent directory, causing stale directory entries
+             safe_remove_all(path);
+         }
+-
+         path = commit_path;
+         hit = true;
+         committed = true;
+diff --git a/include/deep_jit/utils/filesystem.hpp b/include/deep_jit/utils/filesystem.hpp
+index 36939cf..c9a17c6 100644
+--- a/include/deep_jit/utils/filesystem.hpp
++++ b/include/deep_jit/utils/filesystem.hpp
+@@ -107,11 +107,17 @@ inline void write_file_sync(const std::filesystem::path& path, const std::string
+ // same parent directory.
+ inline void safe_remove_all(const std::filesystem::path& path) {
+     std::error_code error_code;
+-    if (not std::filesystem::exists(path, error_code) or error_code)
++    const auto status = std::filesystem::symlink_status(path, error_code);
++    if (error_code == std::errc::no_such_file_or_directory)
++        return;
++    if (error_code)
++        return;
++    if (status.type() == std::filesystem::file_type::not_found)
+         return;
+ 
+-    // A single file
+-    if (not std::filesystem::is_directory(path, error_code) or error_code) {
++    // Remove symlinks themselves, never their targets. This also handles a
++    // symlink passed as the root path and dangling links encountered in a tree.
++    if (status.type() != std::filesystem::file_type::directory) {
+         std::filesystem::remove(path, error_code);
+         return;
+     }
+@@ -126,7 +132,6 @@ inline void safe_remove_all(const std::filesystem::path& path) {
+     }
+     std::filesystem::remove(path, error_code);
+ }
+-
+ inline std::optional<std::filesystem::path> normalize_path(const std::optional<std::filesystem::path>& path) {
+     if (not path or path->empty())
+         return std::nullopt;
+diff --git a/tests/test_ascend_proj/main.cpp b/tests/test_ascend_proj/main.cpp
+index c1e721b..4ebd4c0 100644
+--- a/tests/test_ascend_proj/main.cpp
++++ b/tests/test_ascend_proj/main.cpp
+@@ -228,6 +228,25 @@ void test_filesystem_and_command(const fs::path& cache_root) {
+     DJ_HOST_ASSERT(not fs::exists(path));
+     DJ_HOST_ASSERT(deep_jit::is_executable("/bin/sh"));
+ 
++    const auto symlink_target = cache_root / "symlink_target";
++    deep_jit::make_dirs(symlink_target / "nested");
++    deep_jit::write_file_sync(symlink_target / "nested/payload", "keep");
++    const auto directory_link = cache_root / "directory_link";
++    fs::create_directory_symlink(symlink_target, directory_link);
++    DJ_HOST_ASSERT(fs::is_symlink(fs::symlink_status(directory_link)), "directory symlink was not created");
++    deep_jit::safe_remove_all(directory_link);
++    DJ_HOST_ASSERT(not fs::exists(directory_link), "safe_remove_all did not remove the directory symlink");
++    DJ_HOST_ASSERT(deep_jit::read(symlink_target / "nested/payload") == "keep",
++                   "safe_remove_all followed a directory symlink and deleted its target");
++    deep_jit::safe_remove_all(symlink_target);
++
++    const auto dangling_target = cache_root / "dangling_target";
++    const auto dangling_link = cache_root / "dangling_link";
++    fs::create_symlink(dangling_target, dangling_link);
++    DJ_HOST_ASSERT(fs::is_symlink(fs::symlink_status(dangling_link)), "dangling symlink was not created");
++    deep_jit::safe_remove_all(dangling_link);
++    DJ_HOST_ASSERT(fs::symlink_status(dangling_link).type() == fs::file_type::not_found,
++                   "safe_remove_all did not remove the dangling symlink");
+     DJ_HOST_ASSERT(deep_jit::call_external_command("sh -c 'printf stdout; printf stderr >&2'") == "stdoutstderr");
+     expect_failure([] { deep_jit::call_external_command("sh -c 'exit 7'"); }, "exit code 7");
+ 
+@@ -258,6 +277,33 @@ void test_disk_and_memory_cache(const fs::path& cache_root) {
+     }
+     DJ_HOST_ASSERT(deep_jit::read(committed_path / "payload") == "complete");
+     DJ_HOST_ASSERT(cache.entry("committed", "digest").hit);
++
++    const auto incomplete_publication_path = primary / "cache/incomplete_publication.digest";
++    deep_jit::make_dirs(incomplete_publication_path);
++    deep_jit::write_file_sync(incomplete_publication_path / "partial", "partial");
++    fs::path pending_publication_path;
++    {
++        auto entry = cache.entry("incomplete_publication", "digest");
++        deep_jit::write_file_sync(entry.path / "payload", "complete");
++        pending_publication_path = entry.path;
++        expect_failure([&] { (void)entry.commit(); }, "failed to publish disk cache entry");
++        DJ_HOST_ASSERT(not entry.hit, "failed publication was reported as a cache hit");
++        DJ_HOST_ASSERT(fs::is_regular_file(pending_publication_path / "payload"),
++                       "failed publication deleted the completed temporary payload");
++        DJ_HOST_ASSERT(fs::is_regular_file(incomplete_publication_path / "partial"),
++                       "failed publication modified the incomplete destination");
++
++        // If a competing writer publishes the destination after our failed
++        // rename, a retry may safely reuse that complete entry.
++        deep_jit::write_file_sync(incomplete_publication_path / deep_jit::kCommitFileName, "");
++        const auto winner = entry.commit();
++        DJ_HOST_ASSERT(winner == incomplete_publication_path,
++                       "retry did not reuse a concurrently published cache entry");
++        DJ_HOST_ASSERT(cache.entry("incomplete_publication", "digest").hit,
++                       "concurrently published cache entry was not visible");
++    }
++    DJ_HOST_ASSERT(not fs::exists(pending_publication_path),
++                   "temporary cache entry survived after reusing a concurrently published entry");
+     expect_failure([&] { (void)cache.entry("invalid/tag", "digest"); }, "cache tag must contain only");
+ 
+     struct Value { int number; };
+diff --git a/tests/test_cuda_proj/main.cpp b/tests/test_cuda_proj/main.cpp
+index 68d6ae5..ec5ce58 100644
+--- a/tests/test_cuda_proj/main.cpp
++++ b/tests/test_cuda_proj/main.cpp
+@@ -389,6 +389,26 @@ void test_filesystem(const fs::path& cache_root) {
+     deep_jit::safe_remove_all(single_file);
+     DJ_HOST_ASSERT(not fs::exists(single_file), "safe_remove_all did not remove a single file");
+     DJ_HOST_ASSERT(not deep_jit::try_update_mtime(single_file), "mtime update unexpectedly succeeded for a missing file");
++
++    const auto symlink_target = cache_root / "symlink_target";
++    deep_jit::make_dirs(symlink_target / "nested");
++    deep_jit::write_file_sync(symlink_target / "nested/payload", "keep");
++    const auto directory_link = cache_root / "directory_link";
++    fs::create_directory_symlink(symlink_target, directory_link);
++    DJ_HOST_ASSERT(fs::is_symlink(fs::symlink_status(directory_link)), "directory symlink was not created");
++    deep_jit::safe_remove_all(directory_link);
++    DJ_HOST_ASSERT(not fs::exists(directory_link), "safe_remove_all did not remove the directory symlink");
++    DJ_HOST_ASSERT(deep_jit::read(symlink_target / "nested/payload") == "keep",
++                   "safe_remove_all followed a directory symlink and deleted its target");
++    deep_jit::safe_remove_all(symlink_target);
++
++    const auto dangling_target = cache_root / "dangling_target";
++    const auto dangling_link = cache_root / "dangling_link";
++    fs::create_symlink(dangling_target, dangling_link);
++    DJ_HOST_ASSERT(fs::is_symlink(fs::symlink_status(dangling_link)), "dangling symlink was not created");
++    deep_jit::safe_remove_all(dangling_link);
++    DJ_HOST_ASSERT(fs::symlink_status(dangling_link).type() == fs::file_type::not_found,
++                   "safe_remove_all did not remove the dangling symlink");
+     deep_jit::safe_remove_all(single_file);
+ }
+ 
+@@ -501,6 +521,33 @@ void test_disk_cache(const fs::path& cache_root) {
+     DJ_HOST_ASSERT(fs::is_regular_file(incomplete_secondary_path / "partial"),
+                    "cache lookup modified an uncommitted secondary entry");
+ 
++
++    const auto incomplete_publication_path = primary / "cache/incomplete_publication.digest";
++    deep_jit::make_dirs(incomplete_publication_path);
++    deep_jit::write_file_sync(incomplete_publication_path / "partial", "partial");
++    fs::path pending_publication_path;
++    {
++        auto entry = cache.entry("incomplete_publication", "digest");
++        deep_jit::write_file_sync(entry.path / "payload", "complete");
++        pending_publication_path = entry.path;
++        expect_failure([&] { (void)entry.commit(); }, "failed to publish disk cache entry");
++        DJ_HOST_ASSERT(not entry.hit, "failed publication was reported as a cache hit");
++        DJ_HOST_ASSERT(fs::is_regular_file(pending_publication_path / "payload"),
++                       "failed publication deleted the completed temporary payload");
++        DJ_HOST_ASSERT(fs::is_regular_file(incomplete_publication_path / "partial"),
++                       "failed publication modified the incomplete destination");
++
++        // If a competing writer publishes the destination after our failed
++        // rename, a retry may safely reuse that complete entry.
++        deep_jit::write_file_sync(incomplete_publication_path / deep_jit::kCommitFileName, "");
++        const auto winner = entry.commit();
++        DJ_HOST_ASSERT(winner == incomplete_publication_path,
++                       "retry did not reuse a concurrently published cache entry");
++        DJ_HOST_ASSERT(cache.entry("incomplete_publication", "digest").hit,
++                       "concurrently published cache entry was not visible");
++    }
++    DJ_HOST_ASSERT(not fs::exists(pending_publication_path),
++                   "temporary cache entry survived after reusing a concurrently published entry");
+     const auto stale_temporary_path = primary / "tmp/stale";
+     deep_jit::make_dirs(stale_temporary_path / "nested");
+     deep_jit::write_file_sync(stale_temporary_path / "nested/payload", "stale");
+-- 
+2.55.0.windows.3
+
