@@ -19,3 +19,4 @@
 核心问题：内存 cache key 不包含 CUDA context，`CUfunction` 缓存在 context 内有效，跨 device/context 复用的契约不明确。
 
 本次对 #30 采用文档契约处理，不改变缓存 key；若上游认为需要运行时检测，可另开补丁。
+`n# 上游覆盖状态`n`n- #2：https://github.com/deepseek-ai/DeepJIT/pull/4`n- #3：https://github.com/deepseek-ai/DeepJIT/pull/5`n- #30：https://github.com/deepseek-ai/DeepJIT/pull/31`n

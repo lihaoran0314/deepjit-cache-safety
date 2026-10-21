@@ -1,3 +1,4 @@
+> 上游状态（2026-10-21）：Issue #2 和 #3 已分别由开放 PR #4、#5 覆盖；本仓库作为独立审计与验证证据保留，不是竞争实现。Issue #30 的 context-affinity 文档已提交为 DeepJIT PR #31。
 # DeepJIT 缓存安全修复包
 
 基线提交：`18fe520b0473fc45d32d2f0e86923da707de19ab`  
